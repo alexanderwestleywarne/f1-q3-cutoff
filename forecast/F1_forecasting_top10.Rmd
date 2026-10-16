@@ -1,0 +1,513 @@
+---
+title: "F1 Logit"
+output: html_notebook
+---
+```{r}
+rm(list = ls())
+setwd("/Users/alexwestley-warne/Library/Mobile Documents/com~apple~CloudDocs/F1 R")
+library(fixest)
+library(rddensity)
+library(f1dataR)
+library(dplyr)
+library(purrr)
+library(rdrobust)
+library(ggplot2)
+library(lme4)
+library(httr); library(jsonlite)   # for the OpenF1 requests
+select    <- dplyr::select
+filter    <- dplyr::filter
+rename    <- dplyr::rename
+summarise <- dplyr::summarise
+```
+
+
+**************************************************************************************************************************************************************
+**************************************************************************************************************************************************************
+**************************************************************************************************************************************************************
+# FORECAST: THE FINAL MODEL
+
+Data sources: the qualifying times for each weekend's forecast come from OpenF1 (free about 30-40 minutes after qualifying ends).
+Form (previous 5 races) and the race outcomes still come from Jolpica, as those don't need to be fast. The historical model above stays on Jolpica too, because OpenF1 only has data from 2023 onwards.
+
+Which probability to read: `p_scored` (the raw frozen model) is the main number. The recalibrated versions (`p_cal` from platt26, `p_cal_v2` from platt26_v2) are logged alongside it so they can be compared over the rest of the season.
+
+## How to use this section
+
+| When | What to run |
+|---|---|
+| Once ever (already done) | **A. Freeze the model**, **C. Backfill 2026**, **D. Recalibrations** |
+| Start of every R session | All **B. Setup** chunks (they only define things, they change nothing) |
+| Saturday, after qualifying | **Step 1** (set the race), **Step 2** (forecast), **Step 3** (record odds) |
+| Any time after the race | **Step 4** (record outcomes and check the record) |
+
+Chunks marked `eval = FALSE` don't run when knitting, but you can still run them with their green play button.
+Lines marked `# <-- INPUT` are the only things you need to change.
+
+## A. Freeze the model - run this once, never again.
+```{r, eval = FALSE}
+# Freeze the final model: base glm, fitted on all 2014-2025 data (needs `est` from above)
+m_final <- glm(scored ~ D * margin_pct + D:pre + pre + q1_gap_pct + form_pts,
+               data = est, family = binomial)
+saveRDS(m_final, "m_final.rds")
+```
+## B. Setup - run these every session
+```{r}
+options(f1dataR.cache = "filesystem")
+
+m_final    <- readRDS("m_final.rds")                                              # the frozen model
+platt26    <- if (file.exists("platt26.rds"))    readRDS("platt26.rds")    else NULL   # recalibration on rounds 1-16
+platt26_v2 <- if (file.exists("platt26_v2.rds")) readRDS("platt26_v2.rds") else NULL   # recalibration on rounds 4-16
+
+# Helpers
+flatten_types <- function(df) {
+  df |>
+    mutate(across(where(is.list), function(col) map_chr(col, function(x)
+      if (is.null(x) || length(x) == 0) NA_character_ else as.character(x[[1]])))) |>
+    mutate(across(everything(), as.character))
+}
+to_sec <- function(x) {
+  parts <- strsplit(na_if(as.character(x), ""), ":")
+  map_dbl(parts, function(p) {
+    if (all(is.na(p))) return(NA_real_)
+    if (length(p) == 2) as.numeric(p[1]) * 60 + as.numeric(p[2]) else as.numeric(p[1])
+  })
+}
+
+# The 5 races before a given round (reaching into last season if needed)
+prev_rounds <- function(season, round, n = 5) {
+  out <- tibble(season = season, round = seq_len(round - 1))
+  if (nrow(out) < n) {
+    last_prev <- nrow(load_schedule(season - 1))
+    out <- bind_rows(tibble(season = season - 1, round = seq_len(last_prev)), out)
+  }
+  tail(out, n)
+}
+
+# Sends a request to OpenF1 and returns the result as a data frame
+openf1 <- function(endpoint, ...) {
+  r <- GET(paste0("https://api.openf1.org/v1/", endpoint), query = list(...))
+  if (status_code(r) == 404) return(data.frame())   # OpenF1 uses 404 for "no results"
+  if (status_code(r) %in% c(401, 403))
+    stop("OpenF1 treats this session as live data until about 30 minutes after it ends - try again later.")
+  stop_for_status(r)
+  fromJSON(content(r, "text", encoding = "UTF-8"))
+}
+```
+```{r}
+# Makes the forecasts for one race (drivers within ±h of the Q2 cut-off), using OpenF1 qualifying times.
+# The qualifying session is found by the race date in Jolpica's schedule, unless a country is given
+# (as OpenF1 names it, e.g. "Singapore", or "Bahrain" for the race held in Malaysia).
+forecast_race <- function(season, round, model, country = NULL, h = 0.4) {
+  # Find the qualifying session in OpenF1
+  if (!is.null(country)) {
+    sess <- openf1("sessions", year = season, country_name = country,
+                   session_name = "Qualifying")
+  } else {
+    target    <- round
+    race_date <- load_schedule(season) |>
+      filter(as.integer(round) == target) |>
+      pull(date) |> as.Date()
+    sess <- openf1("sessions", year = season, session_name = "Qualifying")
+    if (nrow(sess) > 0)
+      sess <- sess |>
+        mutate(q_date = as.Date(substr(date_start, 1, 10))) |>
+        filter(q_date <= race_date, q_date >= race_date - 3)
+  }
+  if (nrow(sess) == 0)
+    stop("No OpenF1 qualifying session found for round ", round, " of ", season, ".")
+  key <- sess$session_key[1]
+
+  # Qualifying result: duration holds the Q1, Q2 and Q3 times (in seconds) for each driver
+  res <- openf1("session_result", session_key = key)
+  if (nrow(res) == 0)
+    stop("OpenF1 has no qualifying result yet - try again a little later.")
+  part <- function(x, k) { x <- unlist(x); if (length(x) >= k) as.numeric(x[k]) else NA_real_ }
+
+  # OpenF1 identifies drivers by number and acronym (e.g. LAW); this matches them to Jolpica's IDs (e.g. "lawson")
+  drv <- openf1("drivers", session_key = key) |> select(driver_number, name_acronym)
+  ids <- load_drivers(season) |> flatten_types() |> select(driver_id, code)
+
+  q <- tibble(driver_number = res$driver_number,
+              q1_sec = map_dbl(res$duration, part, k = 1),
+              q2_sec = map_dbl(res$duration, part, k = 2)) |>
+    left_join(drv, by = "driver_number") |>
+    left_join(ids, by = c("name_acronym" = "code")) |>
+    mutate(q1_gap_pct = 100 * (q1_sec / min(q1_sec, na.rm = TRUE) - 1))
+
+  if (any(is.na(q$driver_id)))
+    warning("No Jolpica ID for: ", paste(q$name_acronym[is.na(q$driver_id)], collapse = ", "))
+
+  q2 <- q |> filter(!is.na(q2_sec)) |> arrange(q2_sec) |>
+    mutate(q2_rank = row_number())
+  cutoff <- (q2$q2_sec[10] + q2$q2_sec[11]) / 2
+
+  # Recent form: average points over the previous 5 races (from Jolpica)
+  pr <- prev_rounds(season, round)
+  form <- map2_dfr(pr$season, pr$round, function(s, r) {
+    Sys.sleep(1)
+    load_results(s, r) |> flatten_types() |>
+      transmute(driver_id, points = as.numeric(points))
+  }) |>
+    group_by(driver_id) |>
+    summarise(form_pts = mean(points), form_n = n(), .groups = "drop")
+
+  q2 |>
+    mutate(margin_pct = -100 * (q2_sec - cutoff) / cutoff,
+           D = as.integer(margin_pct > 0),
+           pre = 0L) |>
+    filter(abs(margin_pct) <= h) |>
+    left_join(form, by = "driver_id") |>
+    mutate(p_scored    = predict(model, newdata = pick(everything()), type = "response"),
+           season      = season,
+           round       = round,
+           p10_p11     = q2_rank %in% c(10, 11),
+           model       = "m_final_v1",
+           created_at  = as.character(Sys.time()),
+           odds_points = NA_real_,      # filled in by Step 3
+           scored      = NA_integer_) |>
+    select(season, round, driver_id, q2_rank, p10_p11, margin_pct, q1_gap_pct,
+           form_pts, form_n, D, p_scored, odds_points, model, created_at, scored)
+}
+
+# The original Jolpica version: used for the backfill, and as a fallback if OpenF1 is unavailable.
+forecast_race_jolpica <- function(season, round, model, h = 0.4) {
+  q <- load_quali(season, round) |> flatten_types() |>
+    type.convert(as.is = TRUE) |>
+    mutate(q1_sec = to_sec(q1), q2_sec = to_sec(q2),
+           q1_gap_pct = 100 * (q1_sec / min(q1_sec, na.rm = TRUE) - 1))
+
+  q2 <- q |> filter(!is.na(q2_sec)) |> arrange(q2_sec) |>
+    mutate(q2_rank = row_number())
+  cutoff <- (q2$q2_sec[10] + q2$q2_sec[11]) / 2
+
+  pr <- prev_rounds(season, round)
+  form <- map2_dfr(pr$season, pr$round, function(s, r) {
+    Sys.sleep(1)
+    load_results(s, r) |> flatten_types() |>
+      transmute(driver_id, points = as.numeric(points))
+  }) |>
+    group_by(driver_id) |>
+    summarise(form_pts = mean(points), form_n = n(), .groups = "drop")
+
+  q2 |>
+    mutate(margin_pct = -100 * (q2_sec - cutoff) / cutoff,
+           D = as.integer(margin_pct > 0),
+           pre = 0L) |>
+    filter(abs(margin_pct) <= h) |>
+    left_join(form, by = "driver_id") |>
+    mutate(p_scored    = predict(model, newdata = pick(everything()), type = "response"),
+           season      = season,
+           round       = round,
+           p10_p11     = q2_rank %in% c(10, 11),
+           model       = "m_final_v1",
+           created_at  = as.character(Sys.time()),
+           odds_points = NA_real_,
+           scored      = NA_integer_) |>
+    select(season, round, driver_id, q2_rank, p10_p11, margin_pct, q1_gap_pct,
+           form_pts, form_n, D, p_scored, odds_points, model, created_at, scored)
+}
+
+# Adds the recalibrated probabilities (p_cal, p_cal_v2) to a forecast, where the corrections exist
+add_calibration <- function(fc) {
+  if (!is.null(platt26))
+    fc$p_cal <- predict(platt26, newdata = data.frame(p_scored = fc$p_scored), type = "response")
+  if (!is.null(platt26_v2))
+    fc$p_cal_v2 <- predict(platt26_v2, newdata = data.frame(p_scored = fc$p_scored), type = "response")
+  fc
+}
+
+# Adds new forecasts to the log (never overwrites existing ones)
+log_forecast <- function(new, file = "forecast_log.csv") {
+  if (file.exists(file)) {
+    old <- read.csv(file, stringsAsFactors = FALSE)
+    new <- anti_join(new, old, by = c("season", "round", "driver_id"))  # never overwrite
+    out <- bind_rows(old, new)
+  } else out <- new
+  write.csv(out, file, row.names = FALSE)
+  invisible(out)
+}
+
+# Writes bookmaker odds (decimal, "to finish in the top 10") into the log for one race
+log_odds <- function(season, round, odds_input, file = "forecast_log.csv") {
+  log <- read.csv(file, stringsAsFactors = FALSE)
+  for (i in seq_len(nrow(odds_input))) {
+    idx <- log$season == season & log$round == round &
+           log$driver_id == odds_input$driver_id[i]
+    if (!any(idx)) message("Not in this race's forecast (more than 0.4% from the cut-off?): ",
+                           odds_input$driver_id[i])
+    log$odds_points[idx] <- odds_input$odds_points[i]
+  }
+  write.csv(log, file, row.names = FALSE)
+  log |> filter(season == !!season, round == !!round) |>
+    select(driver_id, q2_rank, p_scored, odds_points)
+}
+```
+```{r}
+# Fills in whether each driver scored, for any race that has finished (from Jolpica)
+update_outcomes <- function(file = "forecast_log.csv") {
+  log <- read.csv(file, stringsAsFactors = FALSE)
+  pending <- log |> filter(is.na(scored)) |> distinct(season, round)
+
+  for (i in seq_len(nrow(pending))) {
+    res <- tryCatch(load_results(pending$season[i], pending$round[i]),
+                    error = function(e) NULL)
+    if (is.null(res) || nrow(res) == 0) next     # race not run yet
+    pts <- res |> flatten_types() |>
+      transmute(driver_id, pts = as.numeric(points))
+    idx <- log$season == pending$season[i] & log$round == pending$round[i]
+    log$scored[idx] <- as.integer(pts$pts[match(log$driver_id[idx], pts$driver_id)] > 0)
+    Sys.sleep(1)
+  }
+  write.csv(log, file, row.names = FALSE)
+  invisible(log)
+}
+```
+```{r}
+# Scores the forecast record.
+# use_cal = FALSE scores p_scored (raw), TRUE scores p_cal (platt26), "v2" scores p_cal_v2 (platt26_v2)
+evaluate_log <- function(file = "forecast_log.csv", only_p10_p11 = FALSE, use_cal = FALSE) {
+  d <- read.csv(file, stringsAsFactors = FALSE)
+
+  col <- if (isTRUE(use_cal)) "p_cal" else if (identical(use_cal, "v2")) "p_cal_v2" else "p_scored"
+  if (!col %in% names(d)) {
+    message("No forecasts with ", col, " logged yet.")
+    return(invisible(NULL))
+  }
+  d$p <- d[[col]]
+
+  d <- d |> filter(!is.na(scored), !is.na(p))   # drops rows with no outcome or no prediction
+  if (only_p10_p11) d <- d |> filter(p10_p11)
+  if (nrow(d) == 0) {
+    message("No completed forecasts to evaluate yet.")
+    return(invisible(NULL))
+  }
+
+  pb    <- mean(d$scored)
+  brier <- mean((d$p - d$scored)^2)
+
+  print(c(n = nrow(d), races = n_distinct(paste(d$season, d$round)),
+          base_rate = pb, brier = brier, skill = 1 - brier / (pb * (1 - pb))))
+
+  print(d |>
+    mutate(band = cut(p, breaks = seq(0, 1, 0.2))) |>
+    group_by(band) |>
+    summarise(n = n(), predicted = mean(p), actual = mean(scored)))
+
+  # Running Brier score, race by race
+  d |>
+    arrange(season, round) |>
+    mutate(race = paste(season, round),
+           cum_brier = cummean((p - scored)^2)) |>
+    ggplot(aes(seq_along(cum_brier), cum_brier)) +
+    geom_line() +
+    geom_hline(yintercept = pb * (1 - pb), linetype = "dashed") +
+    labs(x = "Forecasts made", y = "Running Brier score",
+         title = paste0("Forecast record: ", col, " (dashed = base-rate benchmark)")) +
+    theme_minimal()
+}
+```
+## C. Backfill 2026 - run this once, never again.
+This was run with the Jolpica version, so it stays on forecast_race_jolpica().
+```{r, eval = FALSE}
+for (r in 1:16) {
+  fc <- tryCatch(forecast_race_jolpica(2026, r, m_final), error = function(e) NULL)
+  if (!is.null(fc)) log_forecast(fc)
+}
+update_outcomes()
+evaluate_log()
+```
+## D. Recalibrations - run each once (already done).
+platt26 is fitted on rounds 1-16. platt26_v2 is fitted on rounds 4-16, leaving out the three races before the FIA's energy changes (Miami).
+Only judge either correction on races from Singapore onwards, as rounds 1-16 were used to build them. After running, re-run the B. Setup chunks.
+```{r, eval = FALSE}
+d26 <- read.csv("forecast_log.csv") |>
+  filter(season == 2026, round <= 16, !is.na(scored), !is.na(p_scored))
+
+platt26 <- glm(scored ~ qlogis(p_scored), data = d26, family = binomial)
+coef(platt26)   # expect intercept > 0 (underprediction) and slope < 1 (overconfidence)
+saveRDS(platt26, "platt26.rds")
+```
+```{r, eval = FALSE}
+d26 <- read.csv("forecast_log.csv") |>
+  filter(season == 2026, round >= 4, round <= 16, !is.na(scored), !is.na(p_scored))
+
+platt26_v2 <- glm(scored ~ qlogis(p_scored), data = d26, family = binomial)
+coef(platt26_v2)
+saveRDS(platt26_v2, "platt26_v2.rds")
+```
+
+**************************************************************************************************************************************************************
+# EACH RACE WEEKEND
+
+## Step 1 - Set the race (Saturday, after qualifying)
+```{r}
+season_now <- 2026   # <-- INPUT: the season
+round_now  <- 17     # <-- INPUT: the round (Singapore = 17, check the table below)
+
+load_schedule(season_now) |> select(round, race_name, date)
+```
+## Step 2 - Forecast (Saturday, after qualifying)
+OpenF1 has the qualifying times about 30-40 minutes after qualifying ends. If it says the data isn't available yet, wait and run it again (or use the Jolpica fallback below).
+```{r}
+fc <- forecast_race(season_now, round_now, m_final) |> add_calibration()
+log_forecast(fc)
+
+# This weekend's forecast: p_scored is the main number; p_cal and p_cal_v2 are the recalibrated versions
+fc |>
+  arrange(desc(p10_p11), q2_rank) |>
+  select(q2_rank, driver_id, p10_p11, margin_pct, p_scored, any_of(c("p_cal", "p_cal_v2")))
+```
+
+Only drivers in this weekend's forecast can be updated. Running it again overwrites the odds for those drivers.
+Calculating the margin of the Book Makers:
+```{r}
+#Change the odds every Saturday evening of a race weekend so that the fair probability can be assessed.
+all_odds <- data.frame(
+  driver_id = c('max_verstappen','leclerc','hamilton','norris','antonelli','russell','piastri','gasly','lawson','arvid_lindblad','hulkenberg','bearman','ocon','sainz','bortoleto','colapinto','alonso','albon','stroll','perez','bottas','hadjar'),   # all 22 drivers
+  odds      = c(1.07,1.08,1.1,1.11,1.1,1.36,1.13,1.4,1.5,1.62,2.38,2.5,3,5.5,4,5.5,7,13,13,101,101,1.4)    # their top-10 decimal odds
+)
+
+fair <- all_odds |>
+  mutate(p_implied = 1 / odds,
+         p_fair    = p_implied / sum(p_implied) * 10,   # bookmaker's probability with the margin removed
+         fair_odds = 1 / p_fair) |>                     # the equivalent margin-free decimal odds
+  select(driver_id, odds, p_implied, p_fair, fair_odds)
+```
+Fallback if OpenF1 is unavailable (e.g. during a live session): uses Jolpica's qualifying data instead, which can take longer to appear.
+```{r, eval = FALSE}
+fc <- forecast_race_jolpica(season_now, round_now, m_final) |> add_calibration()
+log_forecast(fc)
+fc |> arrange(desc(p10_p11), q2_rank) |>
+  select(q2_rank, driver_id, p10_p11, margin_pct, p_scored, any_of(c("p_cal", "p_cal_v2")))
+```
+Optional - grid penalties: if a driver in the forecast gets a grid penalty, or is promoted by someone else's, this shows a penalty-adjusted probability (display only, not logged).
+The shift is official starting grid minus FINAL qualifying position (the Q3 result for Q3 drivers), so it only measures penalties. A driver who improves in Q3 and starts there has a shift of 0, because the Q3 benefit is already in the model through D.
+The -0.076 per place comes from the grid_shift test in the Accuracy section. Drivers you don't list are treated as having no shift.
+```{r}
+grid_input <- data.frame(
+  driver_id = c("gasly", "arvid_lindblad", "hulkenberg", "bearman"),   # <-- INPUT: drivers in this weekend's forecast (Jolpica IDs)
+  quali_pos = c(7, 10, 11, 12),                                         # <-- INPUT: FINAL qualifying position (Q3 result for Q3 drivers)
+  grid      = c(7, 9, 10, 11)                                           # <-- INPUT: official starting grid slot (pit-lane start = 22)
+)
+
+missing_ids <- setdiff(grid_input$driver_id, fc$driver_id)
+if (length(missing_ids) > 0)
+  message("Not in this weekend's forecast (check the ID, or they're more than 0.4% from the cut-off): ",
+          paste(missing_ids, collapse = ", "))
+
+fc <- fc |>
+  left_join(grid_input, by = "driver_id") |>
+  left_join(fair, by = "driver_id") |>
+  mutate(grid_shift = coalesce(grid - quali_pos, 0),
+         p_adj      = plogis(qlogis(p_cal_v2) - 0.076 * grid_shift),
+         edge       = p_adj - p_fair,          # positive = your model rates them higher than the market
+         ev         = p_adj * odds - 1) |>     # expected value per 1 unit at the actual odds offered
+  arrange(desc(p10_p11), q2_rank) |>
+  select(driver_id, q2_rank, quali_pos, grid, p_adj,
+         odds, p_implied, p_fair, edge, ev)
+fc
+```
+```{r}
+wager <- 1
+expected_profit <- fc$ev[fc$driver_id=="arvid_lindblad"]*wager
+#expected_profit
+top_ev <- max(fc$ev)
+top_ev_driver <- fc$driver_id[fc$ev==top_ev]
+min_ev <- min(fc$ev)
+min_ev_driver <- fc$driver_id[fc$ev==min_ev]
+drivers <- c(min_ev_driver,top_ev_driver)
+Expected_Value <- c(min_ev,top_ev)
+Expected_profit_total <- c(min_ev*wager,top_ev*wager)
+max_min_ev <- data.frame(drivers,Expected_Value,Expected_profit_total)
+max_min_ev
+```
+
+
+## Step 4 - After the race (any time, even days later)
+Fills in who scored once Jolpica has the result, then checks the record so far.
+```{r}
+update_outcomes()
+
+evaluate_log()                    # raw (p_scored)
+evaluate_log(use_cal = TRUE)      # platt26 (p_cal)
+evaluate_log(use_cal = 'v2')      # platt26_v2 (p_cal_v2)
+```
+**************************************************************************************************************************************************************
+**************************************************************************************************************************************************************
+**************************************************************************************************************************************************************
+# REVIEW AND FINDINGS
+
+## Forecast performance by race
+```{r}
+data <- read.csv("forecast_log.csv") |>
+  filter(season == 2026, !is.na(scored), !is.na(p_scored)) |>
+  group_by(round) |>
+  summarise(n            = n(),
+            brier        = mean((p_scored - scored)^2),   # computed first, on the 0/1 outcomes
+            share_scored = mean(scored)) |>
+  arrange(round) |>
+  print(n = Inf)
+ggplot(data, aes(data$round,data$brier)) +geom_line()
+```
+The above plot of the Brier score has one unit root and no clear trend, will keep asessing this.
+```{r}
+brier_ts <- ts(data$brier)
+summary(ur.df(brier_ts,lags = 7,selectlags = 'AIC'))
+dbrier_ts <- diff(brier_ts)
+ts_plot(dbrier_ts)
+ddbrier_ts <- diff(dbrier_ts)
+ts_plot(ddbrier_ts)
+summary(ur.df(dbrier_ts,selectlags = 'AIC'))
+```
+
+
+
+Platt adjustment did little. At the end of the season, the model should be rebuilt with 2026 data (and a 2026-era indicator) to correct for the change in regulations.
+The model shouldn't necessarily be used in the case of rain or other outlier events; it holds well under normal circumstances.
+
+## Calibrated vs uncalibrated Logit
+```{r}
+library(tidyr)
+
+from_round <- 13   # <-- INPUT: first round to include
+
+d26 <- read.csv("forecast_log.csv") |>
+  filter(season == 2026, round >= from_round, round <= 20, !is.na(scored), !is.na(p_scored)) |>
+  arrange(round) |>
+  mutate(p_cal_ins = predict(platt26, newdata = data.frame(p_scored = p_scored),
+                             type = "response"))
+
+pb <- mean(d26$scored)
+
+d26 |>
+  mutate(forecast   = row_number(),
+         Raw        = cummean((p_scored  - scored)^2),
+         Calibrated = cummean((p_cal_ins - scored)^2)) |>
+  pivot_longer(c(Raw, Calibrated), names_to = "version", values_to = "cum_brier") |>
+  ggplot(aes(forecast, cum_brier, colour = version)) +
+  geom_line() +
+  geom_hline(yintercept = pb * (1 - pb), linetype = "dashed") +
+  labs(x = paste0("Forecasts made (2026, rounds ", from_round, "-16)"), y = "Running Brier score",
+       colour = NULL,
+       title = "Raw vs calibrated forecasts, 2026",
+       subtitle = "Calibrated line is in-sample: the correction was fitted on these same races") +
+  theme_minimal()
+```
+## Market vs model: is the P10-over-P11 advantage underpriced? (once several races have odds)
+The hypothesis predicts `actual` > `market`: P10 out-scores P11 by more than the odds imply.
+```{r}
+gaps <- read.csv("forecast_log.csv") |>
+  filter(p10_p11, !is.na(odds_points), !is.na(scored)) |>
+  mutate(p_book = 1 / odds_points) |>
+  group_by(season, round) |>
+  filter(n() == 2) |>                                  # both P10 and P11 recorded
+  summarise(market_gap = p_book[q2_rank == 10]   - p_book[q2_rank == 11],
+            model_gap  = p_scored[q2_rank == 10] - p_scored[q2_rank == 11],
+            actual_gap = scored[q2_rank == 10]   - scored[q2_rank == 11],
+            .groups = "drop")
+
+gaps |> summarise(races = n(),
+                  market = mean(market_gap),
+                  model  = mean(model_gap),
+                  actual = mean(actual_gap))
+```
